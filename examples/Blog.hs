@@ -20,10 +20,10 @@ import           Control.Monad.Trans.Control (ComposeSt, MonadBaseControl (..),
 import           Database.Persist.Postgresql (ConnectionString)
 -------------------------------------------------------------------------------
 
+deriving instance (Monad m) => MonadReader ConnectionString (NoLoggingT (ReaderT ConnectionString m))
 
 newtype BlogT m a = BlogT { unBlogT :: NoLoggingT (ReaderT ConnectionString m) a }
   deriving (Functor, Applicative, Monad, MonadLogger, MonadReader ConnectionString, MonadIO)
-
 
 -------------------------------------------------------------------------------
 instance MonadTrans BlogT where

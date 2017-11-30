@@ -30,6 +30,7 @@ when:
 executables:
   blog-example:
     main: Main.hs
+    other-modules: Blog
 
 flags:
   werror:

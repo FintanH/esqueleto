@@ -216,26 +216,26 @@ main = do
     setupDb
     putPersons
 
-    johns <- getJohns
-    mapM_ say johns
-
-    adults <- getAdults
-    mapM_ say adults
-
-    authorBlogPosts <- getBlogPostsByAuthors
-    mapM_ say authorBlogPosts
-
-    authoMaybePosts <- getAuthorMaybePosts
-    mapM_ say authoMaybePosts
+    -- johns <- getJohns
+    -- mapM_ say johns
+    --
+    -- adults <- getAdults
+    -- mapM_ say adults
+    --
+    -- authorBlogPosts <- getBlogPostsByAuthors
+    -- mapM_ say authorBlogPosts
+    --
+    -- authoMaybePosts <- getAuthorMaybePosts
+    -- mapM_ say authoMaybePosts
 
     mutualFollowers <- followers
     mapM_ say mutualFollowers
 
-    updateJoao
-    deleteYoungsters
-    insertBlogPosts
+    -- updateJoao
+    -- deleteYoungsters
+    -- insertBlogPosts
     cleanDb
   where
     say :: (MonadIO m, Show a) => a -> m ()
     say = liftIO . print
-    connection = "host=localhost port=5433 user=postgres dbname=esqueleto_blog_example password=***"
+    connection = "host=localhost port=5432 user=postgres dbname=esqueleto_blog_example password=Leon93"
