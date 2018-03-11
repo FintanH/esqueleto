@@ -17,17 +17,14 @@
 module Database.Esqueleto.Internal.Sql
   ( -- * The pretty face
     SqlQuery
-  , SqlExpr
+  , SqlExpr(..)
   , SqlEntity
   , select
   , selectSource
-  , selectDistinct
-  , selectDistinctSource
   , delete
   , deleteCount
   , update
   , updateCount
-  , insertSelectDistinct
   , insertSelect
   , insertSelectCount
     -- * The guts
@@ -38,17 +35,25 @@ module Database.Esqueleto.Internal.Sql
   , unsafeSqlFunction
   , unsafeSqlExtractSubField
   , UnsafeSqlFunctionArgument
+  , OrderByClause
   , rawSelectSource
   , runSource
   , rawEsqueleto
   , toRawSql
   , Mode(..)
+  , NeedParens(..)
   , IdentState
   , initialIdentState
   , IdentInfo
   , SqlSelect(..)
   , veryUnsafeCoerceSqlExprValue
   , veryUnsafeCoerceSqlExprValueList
+  -- * Helper functions
+  , makeOrderByNoNewline
+  , uncommas'
+  , parens
+  , toArgList
+  , builderToText
   ) where
 
 import Control.Arrow ((***), first)
@@ -300,7 +305,6 @@ useIdent :: IdentInfo -> Ident -> TLB.Builder
 useIdent info (I ident) = fromDBName info $ DBName ident
 
 
-----------------------------------------------------------------------
 
 
 -- | An expression on the SQL backend.
@@ -456,9 +460,10 @@ instance Esqueleto SqlQuery SqlExpr SqlBackend where
     where
       toDistinctOn :: SqlExpr OrderBy -> SqlExpr DistinctOn
       toDistinctOn (EOrderBy _ f) = EDistinctOn f
+      toDistinctOn EOrderRandom =
+        error "We can't select distinct by a random order!"
 
   sub_select         = sub SELECT
-  sub_selectDistinct = sub_select . distinct
 
   (^.) :: forall val typ. (PersistEntity val, PersistField typ)
        => SqlExpr (Entity val) -> EntityField val typ -> SqlExpr (Value typ)
@@ -470,6 +475,14 @@ instance Esqueleto SqlQuery SqlExpr SqlBackend where
       dot info x  = useIdent info ident <> "." <> fromDBName info (fieldDB x)
       ed          = entityDef $ getEntityVal (Proxy :: Proxy (SqlExpr (Entity val)))
       Just pdef   = entityPrimary ed
+
+  withNonNull :: PersistField typ
+              => SqlExpr (Value (Maybe typ))
+              -> (SqlExpr (Value typ) -> SqlQuery a)
+              -> SqlQuery a
+  withNonNull field f = do
+    where_ $ not_ $ isNothing field
+    f $ veryUnsafeCoerceSqlExprValue field
 
   EMaybe r ?. field = just (r ^. field)
 
@@ -528,7 +541,6 @@ instance Esqueleto SqlQuery SqlExpr SqlBackend where
   castString = veryUnsafeCoerceSqlExprValue
 
   subList_select         = EList . sub_select
-  subList_selectDistinct = subList_select . distinct
 
   valList []   = EEmptyList
   valList vals = EList $ ERaw Parens $ const ( uncommas ("?" <$ vals)
@@ -781,20 +793,21 @@ veryUnsafeCoerceSqlExprValueList EEmptyList = throw (UnexpectedCaseErr EmptySqlE
 
 ----------------------------------------------------------------------
 
-
 -- | (Internal) Execute an @esqueleto@ @SELECT@ 'SqlQuery' inside
 -- @persistent@'s 'SqlPersistT' monad.
 rawSelectSource :: ( SqlSelect a r
                    , MonadIO m1
-                   , MonadIO m2 )
+                   , MonadIO m2
+                   )
                  => Mode
                  -> SqlQuery a
-                 -> SqlReadT m1 (Acquire (C.Source m2 r))
+                 -> SqlReadT m1 (Acquire (C.ConduitT () r m2 ()))
 rawSelectSource mode query =
       do
-        conn <- persistBackend <$> R.ask
-        res <- run conn
-        return $ (C.$= massage) `fmap` res
+        conn <- projectBackend <$> R.ask
+        let _ = conn :: SqlBackend
+        res <- R.withReaderT (const conn) (run conn)
+        return $ (C..| massage) `fmap` res
     where
 
       run conn =
@@ -815,9 +828,13 @@ rawSelectSource mode query =
 -- | Execute an @esqueleto@ @SELECT@ query inside @persistent@'s
 -- 'SqlPersistT' monad and return a 'C.Source' of rows.
 selectSource :: ( SqlSelect a r
-                , MonadResource m )
+               , BackendCompatible SqlBackend backend
+               , IsPersistBackend backend
+               , PersistQueryRead backend
+               , PersistStoreRead backend, PersistUniqueRead backend
+               , MonadResource m )
              => SqlQuery a
-             -> C.Source (SqlPersistT m) r
+             -> C.ConduitT () r (R.ReaderT backend m) ()
 selectSource query = do
   res <- lift $ rawSelectSource SELECT query
   (key, src) <- lift $ allocateAcquire res
@@ -866,40 +883,19 @@ selectSource query = do
 -- function composition that the @p@ inside the query is of type
 -- @SqlExpr (Entity Person)@.
 select :: ( SqlSelect a r
-          , MonadIO m )
+          , MonadIO m
+          )
        => SqlQuery a -> SqlReadT m [r]
 select query = do
     res <- rawSelectSource SELECT query
     conn <- R.ask
     liftIO $ with res $ flip R.runReaderT conn . runSource
 
-
--- | Execute an @esqueleto@ @SELECT DISTINCT@ query inside
--- @persistent@'s 'SqlPersistT' monad and return a 'C.Source' of
--- rows.
-selectDistinctSource
-  :: ( SqlSelect a r
-     , MonadResource m )
-  => SqlQuery a
-  -> C.Source (SqlPersistT m) r
-selectDistinctSource = selectSource . distinct
-{-# DEPRECATED selectDistinctSource "Since 2.2.4: use 'selectSource' and 'distinct'." #-}
-
-
--- | Execute an @esqueleto@ @SELECT DISTINCT@ query inside
--- @persistent@'s 'SqlPersistT' monad and return a list of rows.
-selectDistinct :: ( SqlSelect a r
-                  , MonadIO m )
-               => SqlQuery a -> SqlPersistT m [r]
-selectDistinct = select . distinct
-{-# DEPRECATED selectDistinct "Since 2.2.4: use 'select' and 'distinct'." #-}
-
-
 -- | (Internal) Run a 'C.Source' of rows.
 runSource :: Monad m =>
-             C.Source (R.ReaderT backend m) r
+             C.ConduitT () r (R.ReaderT backend m) ()
           -> R.ReaderT backend m [r]
-runSource src = src C.$$ CL.consume
+runSource src = C.runConduit $ src C..| CL.consume
 
 
 ----------------------------------------------------------------------
@@ -907,12 +903,12 @@ runSource src = src C.$$ CL.consume
 
 -- | (Internal) Execute an @esqueleto@ statement inside
 -- @persistent@'s 'SqlPersistT' monad.
-rawEsqueleto :: ( MonadIO m, SqlSelect a r, IsSqlBackend backend)
+rawEsqueleto :: ( MonadIO m, SqlSelect a r, BackendCompatible SqlBackend backend)
            => Mode
            -> SqlQuery a
            -> R.ReaderT backend m Int64
 rawEsqueleto mode query = do
-  conn <- persistBackend <$> R.ask
+  conn <- R.ask
   uncurry rawExecuteCount $
     first builderToText $
     toRawSql mode (conn, initialIdentState) query
@@ -964,17 +960,29 @@ deleteCount = rawEsqueleto DELETE
 -- 'set' p [ PersonAge '=.' 'just' ('val' thisYear) -. p '^.' PersonBorn ]
 -- 'where_' $ isNothing (p '^.' PersonAge)
 -- @
-update :: ( MonadIO m
-          , SqlEntity val )
-       => (SqlExpr (Entity val) -> SqlQuery ())
-       -> SqlWriteT m ()
+update
+  ::
+  ( PersistEntityBackend val ~ backend
+  , PersistEntity val
+  , PersistUniqueWrite backend
+  , PersistQueryWrite backend
+  , BackendCompatible SqlBackend backend
+  , PersistEntity val
+  , MonadIO m
+  )
+  => (SqlExpr (Entity val) -> SqlQuery ())
+  -> R.ReaderT backend m ()
 update = void . updateCount
 
 -- | Same as 'update', but returns the number of rows affected.
 updateCount :: ( MonadIO m
-               , SqlEntity val )
+               , PersistEntity val
+               , PersistEntityBackend val ~ backend
+               , BackendCompatible SqlBackend backend
+               , PersistQueryWrite backend
+               , PersistUniqueWrite backend)
             => (SqlExpr (Entity val) -> SqlQuery ())
-            -> SqlWriteT m Int64
+            -> R.ReaderT backend m Int64
 updateCount = rawEsqueleto UPDATE . from
 
 
@@ -994,7 +1002,7 @@ builderToText = TL.toStrict . TLB.toLazyTextWith defaultChunkSize
 -- possible but tedious), you may just turn on query logging of
 -- @persistent@.
 toRawSql
-  :: (IsSqlBackend backend, SqlSelect a r)
+  :: (SqlSelect a r, BackendCompatible SqlBackend backend)
   => Mode -> (backend, IdentState) -> SqlQuery a -> (TLB.Builder, [PersistValue])
 toRawSql mode (conn, firstIdentState) query =
   let ((ret, sd), finalIdentState) =
@@ -1014,7 +1022,7 @@ toRawSql mode (conn, firstIdentState) query =
       -- that were used) to the subsequent calls.  This ensures
       -- that no name clashes will occur on subqueries that may
       -- appear on the expressions below.
-      info = (persistBackend conn, finalIdentState)
+      info = (projectBackend conn, finalIdentState)
   in mconcat
       [ makeInsertInto info mode ret
       , makeSelect     info mode distinctClause ret
@@ -1145,9 +1153,10 @@ makeHaving info (Where (ERaw _ f))         = first ("\nHAVING " <>) (f info)
 makeHaving _    (Where (ECompositeKey _)) = throw (CompositeKeyErr MakeHavingError)
 
 -- makeHaving, makeWhere and makeOrderBy
-makeOrderBy :: IdentInfo -> [OrderByClause] -> (TLB.Builder, [PersistValue])
-makeOrderBy _    [] = mempty
-makeOrderBy info os = first ("\nORDER BY " <>) . uncommas' $ concatMap mk os
+makeOrderByNoNewline ::
+     IdentInfo -> [OrderByClause] -> (TLB.Builder, [PersistValue])
+makeOrderByNoNewline _    [] = mempty
+makeOrderByNoNewline info os = first ("ORDER BY " <>) . uncommas' $ concatMap mk os
   where
     mk :: OrderByClause -> [(TLB.Builder, [PersistValue])]
     mk (EOrderBy t (ERaw p f)) = [first ((<> orderByType t) . parensM p) (f info)]
@@ -1159,6 +1168,13 @@ makeOrderBy info os = first ("\nORDER BY " <>) . uncommas' $ concatMap mk os
     orderByType ASC  = " ASC"
     orderByType DESC = " DESC"
 
+makeOrderBy :: IdentInfo -> [OrderByClause] -> (TLB.Builder, [PersistValue])
+makeOrderBy _ [] = mempty
+makeOrderBy info is =
+  let (tlb, vals) = makeOrderByNoNewline info is
+  in ("\n" <> tlb, vals)
+
+{-# DEPRECATED EOrderRandom "Since 2.6.0: `rand` ordering function is not uniform across all databases! To avoid accidental partiality it will be removed in the next major version." #-}
 
 makeLimit :: IdentInfo -> LimitClause -> [OrderByClause] -> (TLB.Builder, [PersistValue])
 makeLimit (conn, _) (Limit ml mo) orderByClauses =
@@ -1786,10 +1802,3 @@ insertSelect = void . insertSelectCount
 insertSelectCount :: (MonadIO m, PersistEntity a) =>
   SqlQuery (SqlExpr (Insertion a)) -> SqlWriteT m Int64
 insertSelectCount = rawEsqueleto INSERT_INTO . fmap EInsertFinal
-
-
--- | Insert a 'PersistField' for every unique selected value.
-insertSelectDistinct :: (MonadIO m, PersistEntity a) =>
-  SqlQuery (SqlExpr (Insertion a)) -> SqlWriteT m ()
-insertSelectDistinct = insertSelect . distinct
-{-# DEPRECATED insertSelectDistinct "Since 2.2.4: use 'insertSelect' and 'distinct'." #-}
